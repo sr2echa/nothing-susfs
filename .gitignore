@@ -1,0 +1,5 @@
+stock/
+.DS_Store
+kernel/
+__pycache__/
+modules_backup.md
