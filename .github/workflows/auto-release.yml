@@ -1,0 +1,396 @@
+name: Auto-build KernelSU-Next + SUSFS (Nothing Phone 3)
+
+# Daily: find the newest STABLE Metroid build in spike0en/nothing_archive, rebuild its exact GKI
+# kernel (same source commit, stock config, stock version string) with KernelSU-Next + SUSFS only,
+# repack the stock boot.img, and publish a release tagged with the archive tag.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      archive_tag:
+        description: "Archive tag to build (blank = newest stable), e.g. Metroid_C5.0-260924-2115"
+        type: string
+        default: ""
+      force:
+        description: "Rebuild even if a release for this tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+env:
+  # Build engine: the proven WildKernels fork with the Phone (3) fixes (source pin, stock misc
+  # config, stock branding). Pinned so upstream changes can't silently alter the kernel config.
+  ENGINE_REPO: sr2echa/GKI_KernelSU_SUSFS
+  ENGINE_REF: ab898f9a6d2e761df3f08c55edf1dc7117927cb8
+  # magiskboot (repacks boot.img, keeps the AVB footer) from the official Magisk APK.
+  MAGISK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+  MAGISK_SHA256: 89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.d.outputs.build }}
+      tag: ${{ steps.d.outputs.tag }}
+      version: ${{ steps.d.outputs.version }}
+      android_version: ${{ steps.d.outputs.android_version }}
+      kernel_version: ${{ steps.d.outputs.kernel_version }}
+      sublevel: ${{ steps.d.outputs.sublevel }}
+      os_patch_level: ${{ steps.d.outputs.os_patch_level }}
+      page_size: ${{ steps.d.outputs.page_size }}
+      common_commit: ${{ steps.d.outputs.common_commit }}
+      kernel_release: ${{ steps.d.outputs.kernel_release }}
+      kernel_timestamp: ${{ steps.d.outputs.kernel_timestamp }}
+      source_date_epoch: ${{ steps.d.outputs.source_date_epoch }}
+      fingerprints: ${{ steps.d.outputs.fingerprints }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install 7-Zip
+        run: sudo apt-get update -qq && (sudo apt-get install -y -qq 7zip || sudo apt-get install -y -qq p7zip-full)
+
+      - name: Detect newest stable build and its kernel source
+        id: d
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.archive_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          args=("$RUNNER_TEMP/fw")
+          [ -n "${TAG:-}" ] && args+=(--tag "$TAG")
+          [ "${FORCE:-false}" = "true" ] && args+=(--force)
+          python3 -I .github/scripts/metroid_detect.py "${args[@]}"
+
+      - name: Keep stock boot.img for repacking
+        if: steps.d.outputs.build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: stock-boot
+          path: ${{ steps.d.outputs.boot_img }}
+          if-no-files-found: error
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      VERSION: ${{ needs.detect.outputs.version }}
+      OS_PATCH_LEVEL: ${{ needs.detect.outputs.os_patch_level }}
+      KREL: ${{ needs.detect.outputs.kernel_release }}
+      KSTAMP: ${{ needs.detect.outputs.kernel_timestamp }}
+    steps:
+      # Engine at the workspace root so its composite actions (./.github/actions/*) resolve.
+      - name: Checkout build engine
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+        with:
+          path: self
+
+      - name: Free Disk Space
+        uses: endersonmenezes/free-disk-space@v4
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.2.0"
+          testing: false
+
+      - name: Setup more Swap (for LTO)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Resolve KernelSU-Next, AnyKernel3 and patch sources
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha() { git ls-remote "$1" "$2" | awk '{print $1; exit}'; }
+          NEXT=$(sha https://github.com/pershoot/KernelSU-Next.git refs/heads/dev-susfs)
+          # Manager must come from the upstream commit the kernel reports (merge base), as main.yml does.
+          BASE=$(curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/pershoot/KernelSU-Next/compare/dev...dev-susfs | jq -r '.merge_base_commit.sha // empty')
+          [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || BASE=$NEXT
+          for v in NEXT; do [[ "${!v}" =~ ^[0-9a-f]{40}$ ]] || { echo "failed to resolve $v"; exit 1; }; done
+          {
+            echo "next_commit=$NEXT"
+            echo "next_base=$BASE"
+            echo "kernel_patches_commit=$(sha https://github.com/WildKernels/kernel_patches.git refs/heads/main)"
+            echo "anykernel3_commit=$(sha https://github.com/WildKernels/AnyKernel3.git refs/heads/gki-2.0)"
+            echo "root_matrix=[{\"root_flavor\":\"next\",\"variant\":\"KernelSU-Next\",\"root_commit\":\"$NEXT\",\"produce\":true}]"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+        with:
+          version: ${{ env.VERSION }}
+          sublevel: ${{ needs.detect.outputs.sublevel }}
+          kernel_patches_commit: ${{ steps.src.outputs.kernel_patches_commit }}
+          anykernel3_commit: ${{ steps.src.outputs.anykernel3_commit }}
+
+      - name: Pin source, version string and timestamp to the stock kernel
+        run: |
+          set -euo pipefail
+          mkdir -p config
+          rm -f config/common_commit_*
+          echo "${{ needs.detect.outputs.common_commit }}" > "config/common_commit_${VERSION}-${OS_PATCH_LEVEL}"
+          printf '%s\n' "$KREL" > config/kernel_release
+          printf '%s\n' "$KSTAMP" > config/kernel_build_timestamp
+          head -v config/*
+
+      - name: Download Kernel Repository
+        uses: ./.github/actions/download-kernel
+        with:
+          version: ${{ env.VERSION }}
+          android_version: ${{ needs.detect.outputs.android_version }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          os_patch_level: ${{ env.OS_PATCH_LEVEL }}
+
+      - name: Verify kernel/common is the stock commit
+        run: |
+          got=$(git -C kernel/common rev-parse HEAD)
+          [ "$got" = "${{ needs.detect.outputs.common_commit }}" ] || { echo "common is $got, expected stock"; exit 1; }
+
+      - name: Spoof /proc/config.gz With Stock Config
+        uses: ./.github/actions/stock-config
+        with:
+          version: ${{ env.VERSION }}
+          page_size: ${{ needs.detect.outputs.page_size }}
+          stock_config_dir: ""
+
+      - name: Set build timestamp to the stock kernel's
+        run: |
+          E=${{ needs.detect.outputs.source_date_epoch }}
+          D=$(date -u -d @"$E" '+%Y-%m-%dT%H:%M:%SZ')
+          { echo "SOURCE_DATE_EPOCH=$E"; echo "KBUILD_BUILD_TIMESTAMP=$KSTAMP"
+            echo "GIT_COMMITTER_DATE=$D"; echo "GIT_AUTHOR_DATE=$D"; } >> "$GITHUB_ENV"
+
+      - name: Extract Sublevel and Set File Name
+        id: extract
+        uses: ./.github/actions/extract-sublevel-file-name
+        with:
+          android_version: ${{ needs.detect.outputs.android_version }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          sublevel: ${{ needs.detect.outputs.sublevel }}
+          os_patch_level: ${{ env.OS_PATCH_LEVEL }}
+          variant: KernelSU-Next
+          page_size: ${{ needs.detect.outputs.page_size }}
+
+      - name: Kernel Fixes
+        uses: ./.github/actions/kernel-fixes
+        with:
+          version: ${{ env.VERSION }}
+          android_version: ${{ needs.detect.outputs.android_version }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          sublevel: ${{ steps.extract.outputs.sublevel }}
+          os_patch_level: ${{ env.OS_PATCH_LEVEL }}
+
+      - name: Setup KernelSU-Next
+        uses: ./.github/actions/root-setup
+        with:
+          flavor: next
+          commit: ${{ steps.src.outputs.next_commit }}
+
+      - name: SUSFS
+        id: susfs
+        uses: ./.github/actions/susfs
+        with:
+          enabled: "true"
+          susfs_commit: ""
+          version: ${{ env.VERSION }}
+          android_version: ${{ needs.detect.outputs.android_version }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          os_patch_level: ${{ env.OS_PATCH_LEVEL }}
+          sublevel: ${{ steps.extract.outputs.sublevel }}
+          root_flavor: next
+
+      # Feature set = SUSFS + Ptrace + Unicode only (the combination proven to boot).
+      # NoMount / DroidSpaces / Networking / NTSync / BBG / BPF / Perf stay OFF: they change
+      # kernel config, which shifts symbol CRCs and makes stock vendor modules refuse to load.
+      - name: Apply Ptrace Patch
+        uses: ./.github/actions/ptrace
+        with:
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+
+      - name: Apply Unicode Fix Patch
+        uses: ./.github/actions/unicode-fix
+        with:
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+
+      - name: Setup Misc Configs
+        uses: ./.github/actions/misc
+        with:
+          version: ${{ env.VERSION }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          android_version: ${{ needs.detect.outputs.android_version }}
+          sublevel: ${{ steps.extract.outputs.sublevel }}
+          variant: KernelSU-Next
+
+      - name: Apply Device-Specific Patches
+        uses: ./.github/actions/apply-device-patches
+        with:
+          version: ${{ env.VERSION }}
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+
+      - name: Apply Kernel Branding (stock release string via config/kernel_release)
+        uses: ./.github/actions/apply-kernel-branding
+        with:
+          variant: KernelSU-Next
+          kernel_version: ${{ needs.detect.outputs.kernel_version }}
+          android_version: ${{ needs.detect.outputs.android_version }}
+          version: ${{ env.VERSION }}
+          sublevel: ${{ steps.extract.outputs.sublevel }}
+          brand_name: Wild
+          keep_kmi: "true"
+
+      - name: Remove Protected Exports
+        uses: ./.github/actions/remove-protected-exports
+
+      - name: Clean Kernel Flags
+        uses: ./.github/actions/clean-kernel-flags
+
+      - name: Scan and collect patch rejects
+        if: always()
+        uses: ./.github/actions/scan-patch-rejects
+
+      - name: Upload Rejects
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.TAG }}-Rejects
+          path: patch-rejects/
+          if-no-files-found: ignore
+
+      - name: Initialize Config Fragment
+        run: touch "${{ github.workspace }}/wild_gki.fragment"
+
+      - name: Build Kernel
+        env:
+          KBUILD_BUILD_USER: kleaf
+          KBUILD_BUILD_HOST: build-host
+        uses: ./.github/actions/build-kernel
+        with:
+          version: ${{ env.VERSION }}
+          page_size: ${{ needs.detect.outputs.page_size }}
+
+      - name: Verify kernel matches stock version string
+        run: |
+          set -euo pipefail
+          banner=$(strings -n 20 AnyKernel3/Image | grep -m1 'Linux version')
+          echo "$banner"
+          case "$banner" in "Linux version $KREL "*) ;; *) echo "release mismatch"; exit 1;; esac
+          case "$banner" in *"$KSTAMP") ;; *) echo "timestamp mismatch"; exit 1;; esac
+          cfg=kernel/bazel-bin/common/kernel_aarch64_config/out_dir/.config
+          if [ ! -f "$cfg" ]; then echo "::warning::no .config at $cfg; skipped config check"; else
+            grep -q '^CONFIG_KSU=y' "$cfg" && grep -q '^CONFIG_KSU_SUSFS=y' "$cfg"
+            for c in FANOTIFY TMPFS_XATTR TMPFS_POSIX_ACL SYSVIPC; do
+              ! grep -q "^CONFIG_$c=y" "$cfg" || { echo "CONFIG_$c=y differs from stock"; exit 1; }
+            done
+          fi
+
+      - name: Resolve KernelSU-Next manager build
+        id: manager
+        continue-on-error: true  # a missing manager build must not block the kernel release
+        uses: ./.github/actions/resolve-managers
+        with:
+          root_flavor: KernelSU-Next
+          all_flavors: next
+          allow_fallback: "true"
+          root_matrix: ${{ steps.src.outputs.root_matrix }}
+          next_commit: ${{ steps.src.outputs.next_base }}
+
+      - name: Download manager APKs
+        if: steps.manager.outputs.manager_list != '' && steps.manager.outputs.manager_list != '[]'
+        continue-on-error: true
+        uses: ./.github/actions/list-manager-apks
+        with:
+          manager_list: ${{ steps.manager.outputs.manager_list }}
+
+      - name: Fetch stock boot.img
+        uses: actions/download-artifact@v7
+        with:
+          name: stock-boot
+          path: stock
+
+      - name: Repack boot.img and assemble release assets
+        id: pkg
+        run: |
+          set -euo pipefail
+          out=release; mkdir -p "$out" mb rp
+          curl -fsSL --retry 3 -o mb/magisk.apk "$MAGISK_URL"
+          echo "$MAGISK_SHA256  mb/magisk.apk" | sha256sum -c -
+          unzip -p mb/magisk.apk lib/x86_64/libmagiskboot.so > mb/magiskboot && chmod +x mb/magiskboot
+          cp stock/boot.img rp/boot.img
+          ( cd rp && ../mb/magiskboot unpack boot.img && cp ../AnyKernel3/Image kernel && ../mb/magiskboot repack boot.img new-boot.img )
+          [ "$(tail -c 64 rp/new-boot.img | head -c 4)" = "AVBf" ] || { echo "AVB footer missing"; exit 1; }
+          strings -n 20 rp/new-boot.img | grep -q "Linux version $KREL " || { echo "repacked image lacks new kernel"; exit 1; }
+          cp rp/new-boot.img "$out/$TAG-KernelSU-Next-SUSFS-boot.img"
+          ( cd AnyKernel3 && zip -qr9 "../$out/$TAG-KernelSU-Next-SUSFS-AnyKernel3.zip" . )
+          cp manager_apks/*.apk "$out/" 2>/dev/null || echo "::warning::no manager APK found"
+          SUSFS_VER=$(grep -hoE 'SUSFS_VERSION "[^"]+"' kernel/common/include/linux/susfs.h 2>/dev/null | cut -d'"' -f2 || true)
+          jq -n --arg tag "$TAG" --arg fp "${{ needs.detect.outputs.fingerprints }}" --arg rel "$KREL" \
+                --arg stamp "$KSTAMP" --arg commit "${{ needs.detect.outputs.common_commit }}" \
+                --arg branch "$VERSION-$OS_PATCH_LEVEL" --arg susfs "${SUSFS_VER:-unknown}" \
+                --arg susfs_commit "${{ steps.susfs.outputs.susfs_commit }}" \
+                --arg ksun "${ROOT_VERSION:-unknown}" --arg ksun_code "${ROOT_VERSION_CODE:-unknown}" \
+                --arg ksun_commit "${{ steps.src.outputs.next_commit }}" \
+                --arg engine "$ENGINE_REPO@$ENGINE_REF" --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{archive_tag:$tag, fingerprints:($fp|split(" ")), kernel_release:$rel, kernel_build_timestamp:$stamp,
+              gki_commit:$commit, gki_branch:$branch, susfs_version:$susfs, susfs_commit:$susfs_commit,
+              kernelsu_next_version:$ksun, kernelsu_next_version_code:$ksun_code, kernelsu_next_commit:$ksun_commit,
+              features:"KernelSU-Next+SUSFS+Ptrace+Unicode", engine:$engine, build_run:$run, boot_tested:false}' \
+            > "$out/build-info.json"
+          ( cd "$out" && sha256sum * > SHA256SUMS && cat SHA256SUMS )
+          echo "susfs=${SUSFS_VER:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          KernelSU-Next + SUSFS kernel for **Nothing Phone (3)** firmware **${TAG#Metroid_}** (built automatically, **boot-tested: no**).
+
+          - Kernel: \`$KREL\` (same GKI commit, config, version string and build date as stock)
+          - SUSFS: ${{ steps.pkg.outputs.susfs }} · KernelSU-Next: ${ROOT_VERSION:-see build-info.json}
+          - Features: KernelSU-Next, SUSFS, Ptrace fix, Unicode fix. Nothing else.
+
+          **Only flash this on exactly ${TAG#Metroid_}.** A kernel from any other build will not boot.
+
+          ### Flash (data is kept)
+          Easiest: \`python3 flasher/nothing_flash.py --tag $TAG --mode root\` from this repo.
+
+          Manual, test first:
+          1. \`adb reboot bootloader\`
+          2. Make sure \`init_boot\` is stock (no Magisk/KernelSU LKM patch).
+          3. \`fastboot boot $TAG-KernelSU-Next-SUSFS-boot.img\` (one-time boot, nothing written). If it hangs, hold Power + Volume Down and you're back.
+          4. If it booted: \`fastboot flash boot_<current slot> $TAG-KernelSU-Next-SUSFS-boot.img\`
+          5. Install the matching KernelSU-Next manager APK from this release.
+
+          Revert: flash the stock \`boot.img\` from the archive to the same slot. Verify downloads with \`SHA256SUMS\`.
+          EOF
+          gh release delete "$TAG" -R "${{ github.repository }}" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "${TAG#Metroid_} · KernelSU-Next + SUSFS" --notes-file notes.md release/*
