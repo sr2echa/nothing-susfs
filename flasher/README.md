@@ -10,7 +10,7 @@ python3 flasher/nothing_flash.py          # interactive menu
 Works on macOS, Linux and Windows (Python 3.9+, standard library only).
 
 ## What it does
-1. Finds your phone over adb or fastboot, and refuses anything that isn't a Phone (3) with an unlocked bootloader.
+1. Finds your phone over adb or fastboot, and refuses anything that isn't a Phone (3). In fastboot mode it also refuses a locked bootloader; over adb a locked bootloader just makes the later fastboot step fail.
 2. Lists Nothing OS builds from [nothing_archive](https://github.com/spike0en/nothing_archive) (stable only;
    `--all-releases` shows betas), marking the one you have installed.
 3. Downloads only what's needed to `~/.nothing-flasher/<build>/`, checks every file against GitHub's checksum and

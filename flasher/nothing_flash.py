@@ -725,7 +725,7 @@ def main():
             apks = root_build["apks"]
             for i, a in enumerate(apks, 1):
                 log(f"  {i}) {a['name']}")
-            apk = apks[pick_number("Which one (spoofed = random package name, harder to detect)?", len(apks)) - 1]
+            apk = apks[pick_number("Which one (the 'spoofed' build installs under a randomized package name)?", len(apks)) - 1]
             run(dev.a("install", "--user", "0", str(fetch_asset(apk, folder / "root"))))
     log("\nDone. Your data was not touched.")
     return 0
